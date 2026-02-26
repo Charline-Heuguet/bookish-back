@@ -1,32 +1,28 @@
 import { Response } from 'express';
-import { pool } from '../config/database';
 import { supabase } from '../config/supabase';
 import { AuthRequest } from '../middleware/auth';
 
 export const getBooks = async (req: AuthRequest, res: Response) => {
   try {
     const { genre, search } = req.query;
-    
-    let query = 'SELECT * FROM books WHERE 1=1';
-    const params: any[] = [];
-    let paramIndex = 1;
+    let query = supabase.from('books').select('*');
 
     if (genre) {
-      query += ` AND genre = $${paramIndex}`;
-      params.push(genre);
-      paramIndex++;
+      query = query.eq('genre', genre);
     }
 
     if (search) {
-      query += ` AND (title ILIKE $${paramIndex} OR author ILIKE $${paramIndex})`;
-      params.push(`%${search}%`);
-      paramIndex++;
+      query = query.or(`title.ilike.%${search}%,author.ilike.%${search}%`);
     }
 
-    query += ' ORDER BY created_at DESC';
+    const { data, error } = await query.order('created_at', { ascending: false });
 
-    const result = await pool.query(query, params);
-    res.json(result.rows);
+    if (error) {
+      console.error('Erreur Supabase:', error);
+      return res.status(500).json({ error: 'Erreur serveur' });
+    }
+
+    res.json(data);
   } catch (error) {
     console.error('Erreur lors de la récupération des livres:', error);
     res.status(500).json({ error: 'Erreur serveur' });
@@ -37,43 +33,84 @@ export const getBookById = async (req: AuthRequest, res: Response) => {
   try {
     const { id } = req.params;
 
-    const bookResult = await pool.query('SELECT * FROM books WHERE id = $1', [id]);
+    const { data: book, error: bookError } = await supabase
+      .from('books')
+      .select('*')
+      .eq('id', id)
+      .single();
 
-    if (bookResult.rows.length === 0) {
+    if (bookError || !book) {
       return res.status(404).json({ error: 'Livre non trouvé' });
     }
 
-    const reviewsResult = await pool.query(
-      `SELECT r.*, u.username 
-       FROM reviews r 
-       JOIN users u ON r.user_id = u.id 
-       WHERE r.book_id = $1 
-       ORDER BY r.created_at DESC`,
-      [id]
-    );
+    const { data: reviews, error: reviewsError } = await supabase
+      .from('reviews')
+      .select(`
+        id,
+        book_id,
+        user_id,
+        rating,
+        comment,
+        reading_status,
+        created_at,
+        users!inner(username)
+      `)
+      .eq('book_id', id)
+      .order('created_at', { ascending: false });
+
+    if (reviewsError) {
+      console.error('Erreur lors de la récupération des avis:', reviewsError);
+    }
+
+    // Reformater les données pour aplatir le username
+    const formattedReviews = reviews?.map((review: any) => ({
+      id: review.id,
+      book_id: review.book_id,
+      user_id: review.user_id,
+      rating: review.rating,
+      comment: review.comment,
+      reading_status: review.reading_status,
+      created_at: review.created_at,
+      username: review.users?.username || 'Anonyme'
+    })) || [];
 
     res.json({
-      ...bookResult.rows[0],
-      reviews: reviewsResult.rows
+      ...book,
+      reviews: formattedReviews
     });
   } catch (error) {
     console.error('Erreur lors de la récupération du livre:', error);
     res.status(500).json({ error: 'Erreur serveur' });
   }
 };
-
 export const createBook = async (req: AuthRequest, res: Response) => {
   try {
     const { title, author, genre, published_year, summary, cover_image_url } = req.body;
 
-    const result = await pool.query(
-      `INSERT INTO books (title, author, genre, published_year, summary, cover_image_url) 
-       VALUES ($1, $2, $3, $4, $5, $6) 
-       RETURNING *`,
-      [title, author, genre, published_year, summary, cover_image_url]
-    );
+    console.log('Creating book with data:', { title, author, genre, published_year, summary, cover_image_url, added_by: req.userId });
 
-    res.status(201).json(result.rows[0]);
+    const { data, error } = await supabase
+      .from('books')
+      .insert([{
+        title,
+        author,
+        genre,
+        published_year,
+        summary,
+        cover_image_url,
+        added_by: req.userId
+      }])
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Erreur Supabase:', error);
+      console.error('Erreur détails:', JSON.stringify(error, null, 2));
+      return res.status(500).json({ error: 'Erreur lors de la création du livre', details: error.message });
+    }
+
+    console.log('Book created successfully:', data);
+    res.status(201).json(data);
   } catch (error) {
     console.error('Erreur lors de la création du livre:', error);
     res.status(500).json({ error: 'Erreur serveur' });
@@ -85,19 +122,25 @@ export const updateBook = async (req: AuthRequest, res: Response) => {
     const { id } = req.params;
     const { title, author, genre, published_year, summary, cover_image_url } = req.body;
 
-    const result = await pool.query(
-      `UPDATE books 
-       SET title = $1, author = $2, genre = $3, published_year = $4, summary = $5, cover_image_url = $6
-       WHERE id = $7 
-       RETURNING *`,
-      [title, author, genre, published_year, summary, cover_image_url, id]
-    );
+    const { data, error } = await supabase
+      .from('books')
+      .update({
+        title,
+        author,
+        genre,
+        published_year,
+        summary,
+        cover_image_url
+      })
+      .eq('id', id)
+      .select()
+      .single();
 
-    if (result.rows.length === 0) {
+    if (error || !data) {
       return res.status(404).json({ error: 'Livre non trouvé' });
     }
 
-    res.json(result.rows[0]);
+    res.json(data);
   } catch (error) {
     console.error('Erreur lors de la mise à jour du livre:', error);
     res.status(500).json({ error: 'Erreur serveur' });
@@ -108,9 +151,12 @@ export const deleteBook = async (req: AuthRequest, res: Response) => {
   try {
     const { id } = req.params;
 
-    const result = await pool.query('DELETE FROM books WHERE id = $1 RETURNING *', [id]);
+    const { error } = await supabase
+      .from('books')
+      .delete()
+      .eq('id', id);
 
-    if (result.rows.length === 0) {
+    if (error) {
       return res.status(404).json({ error: 'Livre non trouvé' });
     }
 
@@ -127,7 +173,12 @@ export const uploadCover = async (req: AuthRequest, res: Response) => {
       return res.status(400).json({ error: 'Aucun fichier fourni' });
     }
 
-    const fileName = `${Date.now()}-${req.file.originalname}`;
+    const cleanFileName = req.file.originalname
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '') // Enlever les accents
+      .replace(/[^a-zA-Z0-9.-]/g, '_'); // Remplacer caractères spéciaux par _
+
+    const fileName = `${Date.now()}-${cleanFileName}`;
     
     const { data, error } = await supabase.storage
       .from('book-covers')

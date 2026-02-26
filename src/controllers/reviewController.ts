@@ -1,5 +1,5 @@
 import { Response } from 'express';
-import { pool } from '../config/database';
+import { supabase } from '../config/supabase';
 import { AuthRequest } from '../middleware/auth';
 
 export const createReview = async (req: AuthRequest, res: Response) => {
@@ -7,18 +7,46 @@ export const createReview = async (req: AuthRequest, res: Response) => {
     const { book_id, rating, comment, reading_status } = req.body;
     const user_id = req.userId;
 
-    const result = await pool.query(
-      `INSERT INTO reviews (book_id, user_id, rating, comment, reading_status) 
-       VALUES ($1, $2, $3, $4, $5) 
-       RETURNING *`,
-      [book_id, user_id, rating, comment, reading_status]
-    );
+    // Vérifier si l'utilisateur a déjà laissé un avis pour ce livre
+    const { data: existing } = await supabase
+      .from('reviews')
+      .select('*')
+      .eq('book_id', book_id)
+      .eq('user_id', user_id)
+      .single();
 
-    res.status(201).json(result.rows[0]);
-  } catch (error: any) {
-    if (error.code === '23505') { // Unique constraint violation
+    if (existing) {
       return res.status(400).json({ error: 'Vous avez déjà laissé un avis pour ce livre' });
     }
+
+    const { data, error } = await supabase
+      .from('reviews')
+      .insert([{
+        book_id,
+        user_id,
+        rating,
+        comment,
+        reading_status
+      }])
+      .select(`
+        *,
+        users!inner(username, email)
+      `)
+      .single();
+
+    if (error) {
+      console.error('Erreur Supabase:', error);
+      return res.status(500).json({ error: 'Erreur lors de la création de l\'avis' });
+    }
+
+    // Formater la réponse avec le username
+    const formattedReview = {
+      ...data,
+      username: (data as any).users?.username || 'Anonyme'
+    };
+
+    res.status(201).json(formattedReview);
+  } catch (error) {
     console.error('Erreur lors de la création de l\'avis:', error);
     res.status(500).json({ error: 'Erreur serveur' });
   }
@@ -30,19 +58,32 @@ export const updateReview = async (req: AuthRequest, res: Response) => {
     const { rating, comment, reading_status } = req.body;
     const user_id = req.userId;
 
-    const result = await pool.query(
-      `UPDATE reviews 
-       SET rating = $1, comment = $2, reading_status = $3
-       WHERE id = $4 AND user_id = $5
-       RETURNING *`,
-      [rating, comment, reading_status, id, user_id]
-    );
+    const { data, error } = await supabase
+      .from('reviews')
+      .update({
+        rating,
+        comment,
+        reading_status
+      })
+      .eq('id', id)
+      .eq('user_id', user_id)
+      .select(`
+        *,
+        users!inner(username)
+      `)
+      .single();
 
-    if (result.rows.length === 0) {
+    if (error || !data) {
       return res.status(404).json({ error: 'Avis non trouvé ou non autorisé' });
     }
 
-    res.json(result.rows[0]);
+    // Formater la réponse avec le username
+    const formattedReview = {
+      ...data,
+      username: (data as any).users?.username || 'Anonyme'
+    };
+
+    res.json(formattedReview);
   } catch (error) {
     console.error('Erreur lors de la mise à jour de l\'avis:', error);
     res.status(500).json({ error: 'Erreur serveur' });
@@ -54,12 +95,15 @@ export const deleteReview = async (req: AuthRequest, res: Response) => {
     const { id } = req.params;
     const user_id = req.userId;
 
-    const result = await pool.query(
-      'DELETE FROM reviews WHERE id = $1 AND user_id = $2 RETURNING *',
-      [id, user_id]
-    );
+    const { data, error } = await supabase
+      .from('reviews')
+      .delete()
+      .eq('id', id)
+      .eq('user_id', user_id)
+      .select()
+      .single();
 
-    if (result.rows.length === 0) {
+    if (error || !data) {
       return res.status(404).json({ error: 'Avis non trouvé ou non autorisé' });
     }
 
